@@ -1,4 +1,4 @@
-.PHONY: install-firecracker install-containerd setup-devmapper setup kernel bootstrap run tidy build fleet
+.PHONY: install-firecracker install-containerd setup-devmapper setup kernel bootstrap run stop tidy build fleet
 
 install-firecracker:
 	./scripts/install-firecracker.sh
@@ -27,6 +27,9 @@ run:
 	FIRECRACKER_BIN=./bin/firecracker \
 	KERNEL_PATH=./assets/vmlinux \
 	go run ./cmd/serve
+
+stop:
+	./scripts/stop.sh
 
 build:
 	go build -o bin/serve ./cmd/serve

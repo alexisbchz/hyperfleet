@@ -17,7 +17,7 @@ func main() {
 		Usage: "hyperfleet CLI",
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "api-url", Sources: cli.EnvVars("FLEET_API_URL"), Value: "http://localhost:8080", Usage: "hyperfleet API URL"},
-			&cli.StringFlag{Name: "api-key", Sources: cli.EnvVars("API_KEY", "FLEET_API_KEY"), Usage: "API key"},
+			&cli.StringFlag{Name: "api-key", Sources: cli.EnvVars("HYPERFLEET_API_KEY"), Usage: "API key"},
 			&cli.StringFlag{Name: "ssh-host", Sources: cli.EnvVars("FLEET_SSH_HOST"), Usage: "SSH host (default: api-url host)"},
 			&cli.StringFlag{Name: "ssh-port", Sources: cli.EnvVars("FLEET_SSH_PORT"), Value: "2222", Usage: "SSH port"},
 			&cli.StringFlag{Name: "output", Aliases: []string{"o"}, Value: "table", Usage: "output format: table | json"},
@@ -25,8 +25,9 @@ func main() {
 		},
 		Commands: []*cli.Command{
 			{
-				Name:  "machines",
-				Usage: "manage machines",
+				Name:    "machines",
+				Aliases: []string{"machine"},
+				Usage:   "manage machines",
 				Commands: []*cli.Command{
 					{
 						Name:      "create",
@@ -73,7 +74,7 @@ func clientFrom(cmd *cli.Command) (*apiClient, error) {
 	apiURL := cmd.String("api-url")
 	apiKey := cmd.String("api-key")
 	if apiKey == "" {
-		return nil, fmt.Errorf("--api-key required (or set $API_KEY)")
+		return nil, fmt.Errorf("--api-key required (or set $HYPERFLEET_API_KEY)")
 	}
 	return newClient(apiURL, apiKey), nil
 }

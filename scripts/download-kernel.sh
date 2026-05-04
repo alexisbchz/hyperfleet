@@ -5,7 +5,7 @@ set -euo pipefail
 
 ASSETS_DIR="${ASSETS_DIR:-assets}"
 KERNEL_VERSION="${KERNEL_VERSION:-5.10.225}"
-FC_CI_VERSION="${FC_CI_VERSION:-v1.10}"
+FC_CI_VERSION="${FC_CI_VERSION:-v1.11}"
 
 ARCH="$(uname -m)"
 case "${ARCH}" in

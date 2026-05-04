@@ -32,7 +32,7 @@ func main() {
 		Flags: []cli.Flag{
 			&cli.StringFlag{Name: "addr", Sources: cli.EnvVars("ADDR"), Value: ":8080", Usage: "HTTP listen address"},
 			&cli.StringFlag{Name: "ssh-addr", Sources: cli.EnvVars("SSH_ADDR"), Value: ":2222", Usage: "SSH gateway listen address"},
-			&cli.StringFlag{Name: "api-key", Sources: cli.EnvVars("API_KEY"), Usage: "API key (generated ephemerally if unset)"},
+			&cli.StringFlag{Name: "api-key", Sources: cli.EnvVars("HYPERFLEET_API_KEY"), Usage: "API key (generated ephemerally if unset)"},
 			&cli.StringFlag{Name: "containerd-sock", Sources: cli.EnvVars("CONTAINERD_SOCK"), Value: "/run/containerd/containerd.sock"},
 			&cli.StringFlag{Name: "namespace", Sources: cli.EnvVars("CONTAINERD_NAMESPACE"), Value: "hyperfleet"},
 			&cli.StringFlag{Name: "snapshotter", Sources: cli.EnvVars("SNAPSHOTTER"), Value: "devmapper"},
@@ -61,7 +61,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	apiKey := cmd.String("api-key")
 	if apiKey == "" {
 		apiKey = randomKey()
-		log.Printf("API_KEY not set; generated ephemeral key: %s", apiKey)
+		log.Printf("HYPERFLEET_API_KEY not set; generated ephemeral key: %s", apiKey)
 	}
 
 	if err := os.MkdirAll(workRoot, 0o755); err != nil {
@@ -116,7 +116,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 
 	sshErrCh := make(chan error, 1)
 	go func() {
-		log.Printf("ssh listening on %s (user=<machine-id>, password=API_KEY)", sshAddr)
+		log.Printf("ssh listening on %s (user=<machine-id>, password=HYPERFLEET_API_KEY)", sshAddr)
 		sshErrCh <- sshSrv.ListenAndServe()
 	}()
 

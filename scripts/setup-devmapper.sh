@@ -7,7 +7,7 @@ set -euo pipefail
 #
 # Requires: dmsetup, losetup, truncate, modprobe, sudo.
 
-POOL_NAME="${POOL_NAME:-hyperfleet-thinpool}"
+POOL_NAME="${POOL_NAME:-containerd-pool}"
 DATA_DIR="${DATA_DIR:-/var/lib/hyperfleet/devmapper}"
 DATA_SIZE="${DATA_SIZE:-10G}"
 META_SIZE="${META_SIZE:-512M}"
@@ -18,6 +18,8 @@ CONTAINERD_CONFIG="${CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
 CONTAINERD_DROPIN_DIR="${CONTAINERD_DROPIN_DIR:-/etc/containerd/config.d}"
 CONTAINERD_DROPIN="${CONTAINERD_DROPIN_DIR}/devmapper.toml"
 STATE_FILE="${DATA_DIR}/state.env"
+UDEV_RULE="/etc/udev/rules.d/99-hyperfleet-containerd.rules"
+ACCESS_GROUP="${ACCESS_GROUP:-containerd}"
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }; }
 require dmsetup
@@ -74,7 +76,7 @@ sudo mkdir -p "${CONTAINERD_DROPIN_DIR}"
 sudo tee "${CONTAINERD_DROPIN}" >/dev/null <<EOF
 [plugins."io.containerd.snapshotter.v1.devmapper"]
   pool_name = "${POOL_NAME}"
-  root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"
+  root_path = "/var/lib/containerd/devmapper"
   base_image_size = "${BASE_IMAGE_SIZE}"
   fs_type = "ext4"
   discard_blocks = true
@@ -85,9 +87,26 @@ if [[ -f "${CONTAINERD_CONFIG}" ]] && ! sudo grep -q '^imports' "${CONTAINERD_CO
     echo 'imports = ["/etc/containerd/config.d/*.toml"]' | sudo tee -a "${CONTAINERD_CONFIG}" >/dev/null
 fi
 
+# Udev rule: per-VM thin volumes are root:root mode 0660 by default, which means
+# Firecracker can't open them as our user. Re-chown to the containerd group.
+echo "installing udev rule ${UDEV_RULE}..."
+sudo tee "${UDEV_RULE}" >/dev/null <<EOF
+SUBSYSTEM=="block", KERNEL=="dm-*", ENV{DM_NAME}=="${POOL_NAME}-snap-*", GROUP="${ACCESS_GROUP}", MODE="0660"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=block --action=change >/dev/null 2>&1 || true
+
 if systemctl is-active --quiet containerd; then
-    echo "restarting containerd to pick up devmapper config..."
-    sudo systemctl restart containerd
+    # Don't restart from inside our own systemd unit (Before=containerd.service
+    # would deadlock — systemctl restart blocks until the dependency chain
+    # settles, but we ARE the chain). On reboot, hyperfleet-devmapper.service
+    # runs ahead of containerd.service so containerd starts fresh after.
+    if [[ -z "${INVOCATION_ID:-}" ]]; then
+        echo "restarting containerd to pick up devmapper config..."
+        sudo systemctl restart containerd
+    else
+        echo "running under systemd; skipping inline restart (containerd starts after this unit)"
+    fi
 fi
 
 echo "devmapper setup complete"

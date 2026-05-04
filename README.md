@@ -57,7 +57,7 @@ In another terminal, build and use the CLI:
 
 ```sh
 make fleet                                          # builds ./bin/fleet
-export FLEET_API_KEY=<key from `make run` output>   # or set it in ~/.zshrc
+export HYPERFLEET_API_KEY=<key from `make run` output>   # or set it in ~/.zshrc
 ./bin/fleet machines create docker.io/library/alpine:3.20
 ./bin/fleet machines list
 ./bin/fleet machines ssh
@@ -90,7 +90,7 @@ console.
 |---|---|---|
 | `--addr` | `ADDR` | `:8080` |
 | `--ssh-addr` | `SSH_ADDR` | `:2222` |
-| `--api-key` | `API_KEY` | _ephemeral random_ |
+| `--api-key` | `HYPERFLEET_API_KEY` | _ephemeral random_ |
 | `--containerd-sock` | `CONTAINERD_SOCK` | `/run/containerd/containerd.sock` |
 | `--namespace` | `CONTAINERD_NAMESPACE` | `hyperfleet` |
 | `--snapshotter` | `SNAPSHOTTER` | `devmapper` |
@@ -124,7 +124,7 @@ fleet machines ssh [<id>]          attach an interactive shell over the SSH gate
 | flag | env | default |
 |---|---|---|
 | `--api-url` | `FLEET_API_URL` | `http://localhost:8080` |
-| `--api-key` | `API_KEY`, `FLEET_API_KEY` | _required_ |
+| `--api-key` | `HYPERFLEET_API_KEY` | _required_ |
 | `--ssh-host` | `FLEET_SSH_HOST` | _api-url host_ |
 | `--ssh-port` | `FLEET_SSH_PORT` | `2222` |
 | `--output, -o` | — | `table` |
@@ -150,6 +150,7 @@ make setup-devmapper     # create loopback thin pool + drop-in config
 make kernel              # download vmlinux into ./assets
 make bootstrap           # install-containerd + setup-devmapper + install-firecracker + kernel
 make run                 # go run ./cmd/serve
+make stop                # find & kill whatever is bound to :8080 (with confirm)
 make build               # build ./bin/serve and ./bin/fleet
 make fleet               # build only ./bin/fleet
 make tidy                # go mod tidy
@@ -340,7 +341,7 @@ Password auth only, in v0:
 | field | value |
 |---|---|
 | username | the machine `id` (CUID) |
-| password | the API key (same value as the REST `API_KEY`) |
+| password | the API key (same value as the REST `HYPERFLEET_API_KEY`) |
 
 Comparison is constant-time (`crypto/subtle.ConstantTimeCompare`). Public-key
 auth and per-user keys are deferred.
