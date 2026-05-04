@@ -31,12 +31,14 @@
 
 ### Requirements
 
+Tested on **Ubuntu 24.04.4 LTS (Noble Numbat)**, kernel 6.17 / x86_64. Other
+modern Linux distros should work but haven't been verified.
+
 - Linux x86_64 or aarch64 (Firecracker is Linux-only)
 - KVM enabled and `/dev/kvm` accessible
 - `systemd`, `sudo`, `git`
 - Go ≥ 1.26
 - `dmsetup`, `losetup`, `mkfs.ext4` (devmapper thin pool)
-- [`gum`](https://github.com/charmbracelet/gum) (interactive `make setup`)
 - ~12 GB free disk for the default loopback thin pool
 
 ### Setup
