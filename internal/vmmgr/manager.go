@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/alexis-bouchez/hyperfleet/internal/network"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -54,6 +57,11 @@ type Config struct {
 	// outlive a single lease window keep their image content protected from GC.
 	// Zero disables renewal and falls back to a 24h one-shot lease.
 	LeaseExpiration time.Duration
+	// Network, if non-nil, gives each VM a tap on the shared bridge with a
+	// static IP, default route, and DNS configured via the kernel ip= boot
+	// param plus a /etc/resolv.conf written into the rootfs before boot.
+	// When nil, VMs boot with loopback only.
+	Network *network.Manager
 }
 
 type Manager struct {
@@ -279,6 +287,21 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 	}
 	defer releaseSnap()
 
+	var alloc network.Allocation
+	if mg.cfg.Network != nil {
+		a, err := mg.cfg.Network.Allocate(e.m.ID)
+		if err != nil {
+			mg.markFailed(e, fmt.Errorf("network: %w", err))
+			return
+		}
+		alloc = a
+		defer mg.cfg.Network.Release(e.m.ID, alloc)
+
+		if err := writeResolvConf(rootfsDevice, alloc.DNS); err != nil {
+			log.Printf("[%s] resolv.conf: %v", e.m.ID, err)
+		}
+	}
+
 	snapResource := leases.Resource{
 		Type: "snapshots/" + mg.cfg.Snapshotter,
 		ID:   "hyperfleet-" + e.m.ID,
@@ -311,7 +334,7 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 		return
 	}
 
-	fcm, err := mg.boot(leaseCtx, rootfsDevice, workDir, stdinR, stdoutW)
+	fcm, err := mg.boot(leaseCtx, rootfsDevice, workDir, stdinR, stdoutW, alloc)
 	if err != nil {
 		stdinR.Close()
 		stdinW.Close()
@@ -343,6 +366,34 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 	}
 	mg.markExited(e)
 	log.Printf("[%s] exited", e.m.ID)
+}
+
+// writeResolvConf mounts the rootfs block device read-write, overwrites
+// /etc/resolv.conf with a single nameserver entry, and unmounts. Done before
+// firecracker opens the device. The Firecracker SDK can pass nameservers via
+// /proc/net/pnp, but that requires the guest to symlink resolv.conf to it; we
+// use Alpine images out of the box so we just write the file.
+func writeResolvConf(device, dns string) error {
+	mp, err := os.MkdirTemp("", "hf-rootfs-")
+	if err != nil {
+		return fmt.Errorf("mkdir mountpoint: %w", err)
+	}
+	defer os.Remove(mp)
+
+	if out, err := exec.Command("mount", device, mp).CombinedOutput(); err != nil {
+		return fmt.Errorf("mount: %w (%s)", err, string(out))
+	}
+	defer func() {
+		if out, err := exec.Command("umount", mp).CombinedOutput(); err != nil {
+			log.Printf("umount %s: %v (%s)", mp, err, string(out))
+		}
+	}()
+
+	etc := filepath.Join(mp, "etc")
+	if err := os.MkdirAll(etc, 0o755); err != nil {
+		return fmt.Errorf("mkdir etc: %w", err)
+	}
+	return os.WriteFile(filepath.Join(etc, "resolv.conf"), []byte("nameserver "+dns+"\n"), 0o644)
 }
 
 // leaseHolder wraps the active lease so the renewal goroutine can swap it out
@@ -421,7 +472,7 @@ func (mg *Manager) prepareSnapshot(ctx context.Context, image client.Image, id s
 	return mounts[0].Source, cleanup, nil
 }
 
-func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin io.Reader, stdout io.Writer) (*firecracker.Machine, error) {
+func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin io.Reader, stdout io.Writer, alloc network.Allocation) (*firecracker.Machine, error) {
 	socketPath := filepath.Join(workDir, "firecracker.sock")
 	_ = os.Remove(socketPath)
 
@@ -440,6 +491,21 @@ func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin
 			MemSizeMib: firecracker.Int64(256),
 			Smt:        firecracker.Bool(false),
 		},
+	}
+
+	if alloc.TapName != "" {
+		cfg.NetworkInterfaces = firecracker.NetworkInterfaces{{
+			StaticConfiguration: &firecracker.StaticNetworkConfiguration{
+				HostDevName: alloc.TapName,
+				MacAddress:  alloc.MacAddress,
+				IPConfiguration: &firecracker.IPConfiguration{
+					IPAddr:      net.IPNet{IP: alloc.IP, Mask: alloc.Mask},
+					Gateway:     alloc.Gateway,
+					Nameservers: []string{alloc.DNS},
+					IfName:      "eth0",
+				},
+			},
+		}}
 	}
 
 	cmd := firecracker.VMCommandBuilder{}.

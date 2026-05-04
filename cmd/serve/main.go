@@ -16,6 +16,7 @@ import (
 
 	"github.com/alexis-bouchez/hyperfleet/internal/api"
 	"github.com/alexis-bouchez/hyperfleet/internal/auth"
+	"github.com/alexis-bouchez/hyperfleet/internal/network"
 	"github.com/alexis-bouchez/hyperfleet/internal/sshd"
 	"github.com/alexis-bouchez/hyperfleet/internal/vmmgr"
 	"github.com/containerd/containerd/v2/client"
@@ -39,6 +40,12 @@ func main() {
 			&cli.StringFlag{Name: "firecracker-bin", Sources: cli.EnvVars("FIRECRACKER_BIN"), Value: "./bin/firecracker"},
 			&cli.StringFlag{Name: "kernel-path", Sources: cli.EnvVars("KERNEL_PATH"), Value: "./assets/vmlinux"},
 			&cli.StringFlag{Name: "work-root", Sources: cli.EnvVars("WORK_ROOT"), Value: "./run"},
+			&cli.StringFlag{Name: "bridge", Sources: cli.EnvVars("HF_BRIDGE"), Value: "hyperfleet0", Usage: "host bridge for VM taps"},
+			&cli.StringFlag{Name: "subnet", Sources: cli.EnvVars("HF_SUBNET"), Value: "10.42.0.0/16", Usage: "subnet for VM IPs"},
+			&cli.StringFlag{Name: "gateway", Sources: cli.EnvVars("HF_GATEWAY"), Value: "10.42.0.1", Usage: "gateway IP assigned to bridge"},
+			&cli.StringFlag{Name: "egress-iface", Sources: cli.EnvVars("HF_EGRESS_IFACE"), Usage: "host egress interface (autodetected if empty)"},
+			&cli.StringFlag{Name: "dns", Sources: cli.EnvVars("HF_DNS"), Value: "1.1.1.1", Usage: "resolver written into guest /etc/resolv.conf"},
+			&cli.BoolFlag{Name: "no-network", Sources: cli.EnvVars("HF_NO_NETWORK"), Usage: "disable per-VM networking (loopback only)"},
 		},
 		Action: run,
 	}
@@ -74,6 +81,27 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer ctrd.Close()
 
+	var netMgr *network.Manager
+	if !cmd.Bool("no-network") {
+		nm, err := network.New(network.Config{
+			Bridge:      cmd.String("bridge"),
+			Subnet:      cmd.String("subnet"),
+			Gateway:     cmd.String("gateway"),
+			EgressIface: cmd.String("egress-iface"),
+			DNS:         cmd.String("dns"),
+		})
+		if err != nil {
+			return fmt.Errorf("network config: %w", err)
+		}
+		if err := nm.Setup(); err != nil {
+			return fmt.Errorf("network setup: %w", err)
+		}
+		netMgr = nm
+		log.Printf("network ready: bridge=%s subnet=%s gateway=%s egress=%s dns=%s",
+			cmd.String("bridge"), cmd.String("subnet"), cmd.String("gateway"),
+			netMgr.Egress(), cmd.String("dns"))
+	}
+
 	mgr := vmmgr.New(vmmgr.Config{
 		Containerd:     ctrd,
 		Namespace:      namespace,
@@ -81,6 +109,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		FirecrackerBin: firecrackerBin,
 		KernelPath:     kernelPath,
 		WorkRoot:       workRoot,
+		Network:        netMgr,
 	})
 	if err := mgr.Load(ctx); err != nil {
 		return fmt.Errorf("load machine state: %w", err)
