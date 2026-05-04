@@ -1,0 +1,14 @@
+[Unit]
+Description=hyperfleet devmapper thin-pool setup
+Before=containerd.service
+After=local-fs.target
+DefaultDependencies=no
+RequiresMountsFor=/var/lib/hyperfleet
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/hyperfleet-setup-devmapper
+
+[Install]
+WantedBy=multi-user.target
