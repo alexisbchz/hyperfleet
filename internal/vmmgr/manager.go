@@ -2,6 +2,7 @@ package vmmgr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,11 @@ type Config struct {
 	FirecrackerBin string
 	KernelPath     string
 	WorkRoot       string
+	// LeaseExpiration is the lifetime of each containerd lease. The manager
+	// renews the lease in the background at half this interval so VMs that
+	// outlive a single lease window keep their image content protected from GC.
+	// Zero disables renewal and falls back to a 24h one-shot lease.
+	LeaseExpiration time.Duration
 }
 
 type Manager struct {
@@ -91,12 +97,65 @@ func (mg *Manager) Create(ctx context.Context, image string) (Machine, error) {
 
 	mg.mu.Lock()
 	mg.machines[id] = e
+	mg.saveStateLocked(e.m)
 	snap := e.m
 	mg.mu.Unlock()
 
 	go mg.run(bgCtx, e)
 
 	return snap, nil
+}
+
+// Load reads persisted machine state from disk and rehydrates the in-memory
+// index. Machines that were running or pending at the time of the previous
+// shutdown are marked failed with "lost on restart" and their work directories
+// are cleaned up; we have no way to reattach to the firecracker process across
+// a server restart in v0.
+func (mg *Manager) Load(ctx context.Context) error {
+	dir := filepath.Join(mg.cfg.WorkRoot, "state")
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read state dir: %w", err)
+	}
+	for _, ent := range entries {
+		if ent.IsDir() || filepath.Ext(ent.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, ent.Name()))
+		if err != nil {
+			log.Printf("state read %s: %v", ent.Name(), err)
+			continue
+		}
+		var m Machine
+		if err := json.Unmarshal(data, &m); err != nil {
+			log.Printf("state unmarshal %s: %v", ent.Name(), err)
+			continue
+		}
+		if m.Status == StatusRunning || m.Status == StatusPending {
+			now := time.Now().UTC()
+			m.Status = StatusFailed
+			m.ExitedAt = &now
+			if m.Error == "" {
+				m.Error = "lost on restart"
+			}
+			_ = os.RemoveAll(filepath.Join(mg.cfg.WorkRoot, m.ID))
+		}
+		closed := make(chan struct{})
+		close(closed)
+		e := &entry{
+			m:      m,
+			cancel: func() {},
+			done:   closed,
+		}
+		mg.mu.Lock()
+		mg.machines[m.ID] = e
+		mg.saveStateLocked(e.m)
+		mg.mu.Unlock()
+	}
+	return nil
 }
 
 func (mg *Manager) List(ctx context.Context) []Machine {
@@ -137,6 +196,7 @@ func (mg *Manager) Delete(ctx context.Context, id string) error {
 	mg.mu.Lock()
 	delete(mg.machines, id)
 	mg.mu.Unlock()
+	mg.removeState(id)
 	return nil
 }
 
@@ -185,12 +245,22 @@ func (mg *Manager) Shutdown(ctx context.Context) {
 func (mg *Manager) run(ctx context.Context, e *entry) {
 	defer close(e.done)
 
-	leaseCtx, doneLease, err := mg.cfg.Containerd.WithLease(ctx, leases.WithExpiration(15*time.Minute))
+	expiry := mg.cfg.LeaseExpiration
+	if expiry <= 0 {
+		expiry = 24 * time.Hour
+	}
+
+	ls := mg.cfg.Containerd.LeasesService()
+	lease, err := ls.Create(ctx, leases.WithRandomID(), leases.WithExpiration(expiry))
 	if err != nil {
 		mg.markFailed(e, fmt.Errorf("acquire lease: %w", err))
 		return
 	}
-	defer doneLease(context.Background())
+	leaseRef := &leaseHolder{cur: lease}
+	defer func() {
+		_ = ls.Delete(context.Background(), leaseRef.get())
+	}()
+	leaseCtx := leases.WithLease(ctx, lease.ID)
 
 	log.Printf("[%s] pulling %s", e.m.ID, e.m.Image)
 	image, err := mg.cfg.Containerd.Pull(leaseCtx, e.m.Image,
@@ -208,6 +278,18 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 		return
 	}
 	defer releaseSnap()
+
+	snapResource := leases.Resource{
+		Type: "snapshots/" + mg.cfg.Snapshotter,
+		ID:   "hyperfleet-" + e.m.ID,
+	}
+	if err := ls.AddResource(leaseCtx, lease, snapResource); err != nil {
+		log.Printf("[%s] lease add resource: %v", e.m.ID, err)
+	}
+
+	renewerDone := make(chan struct{})
+	go mg.renewLease(ctx, e.m.ID, ls, leaseRef, snapResource, expiry, renewerDone)
+	defer func() { <-renewerDone }()
 
 	workDir := filepath.Join(mg.cfg.WorkRoot, e.m.ID)
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
@@ -263,6 +345,58 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 	log.Printf("[%s] exited", e.m.ID)
 }
 
+// leaseHolder wraps the active lease so the renewal goroutine can swap it out
+// while run()'s deferred cleanup still deletes whichever one is current.
+type leaseHolder struct {
+	mu  sync.Mutex
+	cur leases.Lease
+}
+
+func (h *leaseHolder) get() leases.Lease {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.cur
+}
+
+func (h *leaseHolder) swap(l leases.Lease) leases.Lease {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prev := h.cur
+	h.cur = l
+	return prev
+}
+
+func (mg *Manager) renewLease(ctx context.Context, id string, ls leases.Manager, holder *leaseHolder, res leases.Resource, expiry time.Duration, done chan<- struct{}) {
+	defer close(done)
+	interval := expiry / 2
+	if interval < time.Minute {
+		interval = time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fresh, err := ls.Create(ctx, leases.WithRandomID(), leases.WithExpiration(expiry))
+			if err != nil {
+				log.Printf("[%s] lease renew create: %v", id, err)
+				continue
+			}
+			if err := ls.AddResource(ctx, fresh, res); err != nil {
+				log.Printf("[%s] lease renew add resource: %v", id, err)
+				_ = ls.Delete(ctx, fresh)
+				continue
+			}
+			old := holder.swap(fresh)
+			if err := ls.Delete(ctx, old); err != nil {
+				log.Printf("[%s] lease renew delete old: %v", id, err)
+			}
+		}
+	}
+}
+
 func (mg *Manager) prepareSnapshot(ctx context.Context, image client.Image, id string) (string, func(), error) {
 	diffIDs, err := image.RootFS(ctx)
 	if err != nil {
@@ -294,7 +428,7 @@ func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin
 	cfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: mg.cfg.KernelPath,
-		KernelArgs:      "console=ttyS0 reboot=k panic=1 pci=off init=/bin/sh",
+		KernelArgs:      "console=ttyS0 reboot=k panic=1 acpi=off init=/bin/sh",
 		Drives: []models.Drive{{
 			DriveID:      firecracker.String("rootfs"),
 			PathOnHost:   firecracker.String(rootfsDevice),
@@ -332,6 +466,7 @@ func (mg *Manager) markRunning(e *entry) {
 	now := time.Now().UTC()
 	e.m.Status = StatusRunning
 	e.m.StartedAt = &now
+	mg.saveStateLocked(e.m)
 }
 
 func (mg *Manager) markExited(e *entry) {
@@ -340,6 +475,7 @@ func (mg *Manager) markExited(e *entry) {
 	now := time.Now().UTC()
 	e.m.Status = StatusExited
 	e.m.ExitedAt = &now
+	mg.saveStateLocked(e.m)
 }
 
 func (mg *Manager) markFailed(e *entry, err error) {
@@ -349,6 +485,43 @@ func (mg *Manager) markFailed(e *entry, err error) {
 	e.m.Status = StatusFailed
 	e.m.ExitedAt = &now
 	e.m.Error = err.Error()
+	mg.saveStateLocked(e.m)
 	log.Printf("[%s] failed: %v", e.m.ID, err)
+}
+
+// saveStateLocked persists a machine's metadata to disk. Caller must hold mg.mu.
+// Failures are logged but not propagated: state-on-disk is a best-effort index
+// for rehydration after a restart, and a write failure shouldn't abort the
+// VM lifecycle.
+func (mg *Manager) saveStateLocked(m Machine) {
+	if mg.cfg.WorkRoot == "" {
+		return
+	}
+	dir := filepath.Join(mg.cfg.WorkRoot, "state")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[%s] state mkdir: %v", m.ID, err)
+		return
+	}
+	final := filepath.Join(dir, m.ID+".json")
+	tmp := final + ".tmp"
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		log.Printf("[%s] state marshal: %v", m.ID, err)
+		return
+	}
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		log.Printf("[%s] state write: %v", m.ID, err)
+		return
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		log.Printf("[%s] state rename: %v", m.ID, err)
+	}
+}
+
+func (mg *Manager) removeState(id string) {
+	if mg.cfg.WorkRoot == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(mg.cfg.WorkRoot, "state", id+".json"))
 }
 

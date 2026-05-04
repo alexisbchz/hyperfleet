@@ -82,6 +82,9 @@ func run(ctx context.Context, cmd *cli.Command) error {
 		KernelPath:     kernelPath,
 		WorkRoot:       workRoot,
 	})
+	if err := mgr.Load(ctx); err != nil {
+		return fmt.Errorf("load machine state: %w", err)
+	}
 
 	router := chi.NewMux()
 	router.Use(auth.HTTPMiddleware(apiKey))

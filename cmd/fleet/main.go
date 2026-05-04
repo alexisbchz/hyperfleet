@@ -54,10 +54,10 @@ func main() {
 						Action:    deleteMachine,
 					},
 					{
-						Name:      "ssh",
-						Usage:     "ssh into a machine via the hyperfleet gateway",
+						Name:      "attach",
+						Usage:     "attach to a machine's serial console via the hyperfleet gateway",
 						ArgsUsage: "<id>",
-						Action:    sshMachine,
+						Action:    attachMachine,
 					},
 				},
 			},
@@ -159,7 +159,7 @@ func deleteMachine(ctx context.Context, cmd *cli.Command) error {
 	return nil
 }
 
-func sshMachine(ctx context.Context, cmd *cli.Command) error {
+func attachMachine(ctx context.Context, cmd *cli.Command) error {
 	apiKey := cmd.String("api-key")
 	if apiKey == "" {
 		return fmt.Errorf("--api-key required")
@@ -169,7 +169,7 @@ func sshMachine(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return err
 	}
-	id, err := resolveMachineID(ctx, cmd, c, "SSH into which machine?")
+	id, err := resolveMachineID(ctx, cmd, c, "Attach to which machine?")
 	if err != nil {
 		return err
 	}
