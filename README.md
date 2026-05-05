@@ -17,8 +17,10 @@
   - [Authentication](#authentication)
   - [Resource: Machine](#resource-machine)
   - [Endpoints](#endpoints)
+  - [In-guest control plane](#in-guest-control-plane)
   - [Errors](#errors)
   - [OpenAPI](#openapi)
+- [Forgejo Actions integration](#forgejo-actions-integration)
 - [SSH gateway](#ssh-gateway)
   - [Connection](#connection)
   - [Authentication](#authentication-1)
@@ -301,6 +303,36 @@ The unauthenticated `401` is hand-written (not Problem Details) and returns:
 
 with `WWW-Authenticate: Bearer realm="hyperfleet"`.
 
+### In-guest control plane
+
+Each microVM runs a small in-guest init binary (`initd/`, statically-linked C
+on musl, ~750 KB) that listens on AF_VSOCK port 1024. Build it with
+`make initd`; the daemon copies the resulting `bin/hyperfleet-init` into the
+rootfs at `/sbin/hyperfleet-init` and the kernel boots into it as PID 1.
+
+The daemon proxies four endpoints from initd, all rooted under `/machines/{id}`
+and gated by the same API key as the rest of the API:
+
+| method | path | body | response |
+|---|---|---|---|
+| `POST` | `/exec` | JSON `{command, env, workdir, user}` | framed stream — see below |
+| `PUT`  | `/files?path=ABS` | tar archive | `204 No Content` |
+| `GET`  | `/files?path=ABS` | — | tar archive |
+| `GET`  | `/stat?path=ABS` | — | JSON `{exists, isDir, mode, size}` |
+| `GET`  | `/healthz` | — | `204` once initd answers |
+
+`POST /exec` returns an `application/octet-stream` whose body is a sequence
+of frames:
+
+```
+[1 B kind][4 B big-endian length][N B payload]
+```
+
+`kind = 1` for stdout, `2` for stderr, `3` for the terminal exit frame
+(payload = 4-byte big-endian int32 exit code), `4` for an error frame
+(payload = UTF-8 message; emitted instead of frame `3` when the guest could
+not run the command at all).
+
 ### OpenAPI
 
 | path | content |
@@ -312,6 +344,59 @@ with `WWW-Authenticate: Bearer realm="hyperfleet"`.
 
 Spec is generated at startup from the registered `huma.Operation`s in
 `internal/api/api.go`; clients can be code-generated from it.
+
+## Forgejo Actions integration
+
+`forgejo-plugin/` is a separate Go module that exposes hyperfleet as a
+[Forgejo Runner v2 backend plugin](https://code.forgejo.org/forgejo/forgejo-actions-feature-requests/issues/107).
+The runner launches it as a subprocess via [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin);
+the plugin translates each `pluginv1.BackendPlugin` RPC into HTTP calls
+against this daemon's REST API:
+
+```
+runner ── go-plugin ──> hyperfleet-forgejo-plugin ── HTTP ──> hyperfleet daemon ── vsock ──> initd
+```
+
+Build it with `make plugin`. To wire it into a runner:
+
+```yaml
+# runner config.yaml
+pluginsv2:
+  hyperfleet:
+    path: /path/to/hyperfleet-forgejo-plugin
+    options: {}
+```
+
+then point the plugin at the daemon via env on the runner process:
+
+```sh
+export HYPERFLEET_API_URL=http://localhost:8080
+export HYPERFLEET_API_KEY=<key>
+forgejo-runner --config config.yaml daemon
+```
+
+A workflow targets the backend with the runner's `<name>:<scheme>://<arg>`
+label format. The label name selects the plugin; the arg is forwarded to
+`Create` via `BackendOptions["label_arg"]` and the plugin uses it as the
+OCI image:
+
+```yaml
+# .forgejo/workflows/hello.yml
+on: [push]
+jobs:
+  greet:
+    runs-on: hyperfleet:hyperfleet://docker.io/library/alpine:3.20
+    steps:
+      - run: echo "hello from a microVM"
+```
+
+The plugin currently exposes one capability per axis: `manages_own_networking=true`,
+`supports_local_copy=true`, `supports_docker_actions=false`, and
+`supports_service_containers=false`. The runner module path
+`code.forgejo.org/forgejo/runner/v12` is replaced with a local clone of
+[Erwan's plugin-fork](https://git.erwanleboucher.dev/eleboucher/runner) at
+`.deps/forgejo-runner-erwan/` because the plugin contract isn't in upstream
+`v12.10.0` yet.
 
 ## SSH gateway
 
@@ -388,11 +473,11 @@ The bundled `fleet machines ssh` currently uses `ssh.InsecureIgnoreHostKey()`
 
 ### Limitations
 
-- **No `init=/bin/sh` ⇒ no real entrypoint**: until the initramfs+initd phase
-  lands, every VM boots into a busybox shell on ttyS0 regardless of the OCI
-  image's `Entrypoint`/`Cmd`.
-- **No exec/signal RPCs**: SSH-into-serial is not the same as `docker exec`.
-  The future vsock-based initd will expose typed `Exec`/`Signal`/`Wait` RPCs.
+- **No real entrypoint**: every VM boots into the in-guest initd, which
+  forks a `/bin/sh` on `/dev/console` for the SSH gateway to attach to.
+  The OCI image's `Entrypoint`/`Cmd` are still ignored. Use the in-guest
+  control plane (`POST /machines/{id}/exec`) for typed command execution
+  instead of relying on the serial shell.
 - **No per-machine SSH host keys**: the host key identifies the *gateway*,
   not the VM. Machines with the same id across daemon restarts present the
   same fingerprint.

@@ -36,3 +36,8 @@ go.work.sum
 /assets/
 /run/
 /hyperfleet
+
+# Vendored fork of code.forgejo.org/forgejo/runner used by the local
+# `replace` directive in forgejo-plugin/go.mod. Anyone reproducing the
+# build clones Erwan's fork into this path themselves.
+/.deps/

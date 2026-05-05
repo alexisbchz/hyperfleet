@@ -119,6 +119,7 @@ func run(ctx context.Context, cmd *cli.Command) error {
 	router.Use(auth.HTTPMiddleware(apiKey))
 	humaAPI := humachi.New(router, huma.DefaultConfig("hyperfleet", "0.1.0"))
 	api.Register(humaAPI, mgr)
+	api.RegisterInitdRoutes(router, mgr)
 
 	srv := &http.Server{
 		Addr:              addr,

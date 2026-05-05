@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/alexis-bouchez/hyperfleet/internal/initd"
 	"github.com/alexis-bouchez/hyperfleet/internal/network"
 	"github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/leases"
@@ -62,6 +63,10 @@ type Config struct {
 	// param plus a /etc/resolv.conf written into the rootfs before boot.
 	// When nil, VMs boot with loopback only.
 	Network *network.Manager
+	// InitdPath is the host-side path to the static hyperfleet-init binary
+	// that gets injected into the rootfs at /sbin/hyperfleet-init before
+	// boot. Empty falls back to "./bin/hyperfleet-init".
+	InitdPath string
 }
 
 type Manager struct {
@@ -69,6 +74,11 @@ type Manager struct {
 
 	mu       sync.RWMutex
 	machines map[string]*entry
+	// nextCID is a monotonic counter of guest vsock CIDs. CIDs 0–2 are
+	// reserved (hypervisor / local / host); we start at 3. Each VM gets a
+	// fresh CID; we never reuse, so an ID collision after restart can't
+	// confuse the kernel's vsock state.
+	nextCID uint32
 }
 
 type entry struct {
@@ -76,13 +86,35 @@ type entry struct {
 	cancel  context.CancelFunc
 	done    chan struct{}
 	console *Console
+	// vsockUDS is the host-side unix socket path firecracker created for
+	// the VM's vsock device. The initd client dials it and writes
+	// "CONNECT <port>\n" to reach the in-guest HTTP server.
+	vsockUDS string
 }
 
 func New(cfg Config) *Manager {
 	return &Manager{
 		cfg:      cfg,
 		machines: make(map[string]*entry),
+		nextCID:  3,
 	}
+}
+
+func (mg *Manager) allocCID() uint32 {
+	mg.mu.Lock()
+	defer mg.mu.Unlock()
+	c := mg.nextCID
+	mg.nextCID++
+	return c
+}
+
+// initdPath resolves the configured initd binary, falling back to the
+// repo-relative default.
+func (mg *Manager) initdPath() string {
+	if mg.cfg.InitdPath != "" {
+		return mg.cfg.InitdPath
+	}
+	return "./bin/hyperfleet-init"
 }
 
 func (mg *Manager) Create(ctx context.Context, image string) (Machine, error) {
@@ -208,6 +240,26 @@ func (mg *Manager) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// InitdClient returns an *initd.Client targeting the in-guest control plane
+// of a running VM. Returns ErrNotFound if the machine doesn't exist, or an
+// error if the VM hasn't reached the running state yet (no vsock UDS).
+func (mg *Manager) InitdClient(id string) (*initd.Client, error) {
+	mg.mu.RLock()
+	e, ok := mg.machines[id]
+	mg.mu.RUnlock()
+	if !ok {
+		return nil, ErrNotFound
+	}
+	mg.mu.RLock()
+	uds := e.vsockUDS
+	status := e.m.Status
+	mg.mu.RUnlock()
+	if uds == "" {
+		return nil, fmt.Errorf("machine %s is %s", id, status)
+	}
+	return initd.New(uds, initd.VsockPort), nil
+}
+
 // Attach returns a ReadWriteCloser bound to the machine's serial console.
 // Returns ErrNotFound if the machine doesn't exist, or an error if the VM
 // is not yet running (no console attached) or has already exited.
@@ -296,10 +348,14 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 		}
 		alloc = a
 		defer mg.cfg.Network.Release(e.m.ID, alloc)
+	}
 
-		if err := writeResolvConf(rootfsDevice, alloc.DNS); err != nil {
-			log.Printf("[%s] resolv.conf: %v", e.m.ID, err)
-		}
+	// Inject the static initd binary (and resolv.conf, when networking is
+	// enabled) into the rootfs in a single mount→write→unmount pass. This
+	// must complete before firecracker opens the device.
+	if err := prepareRootfs(rootfsDevice, mg.initdPath(), alloc.DNS); err != nil {
+		mg.markFailed(e, fmt.Errorf("prepare rootfs: %w", err))
+		return
 	}
 
 	snapResource := leases.Resource{
@@ -334,7 +390,9 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 		return
 	}
 
-	fcm, err := mg.boot(leaseCtx, rootfsDevice, workDir, stdinR, stdoutW, alloc)
+	cid := mg.allocCID()
+	vsockUDS := filepath.Join(workDir, "vsock.sock")
+	fcm, err := mg.boot(leaseCtx, rootfsDevice, workDir, stdinR, stdoutW, alloc, cid, vsockUDS)
 	if err != nil {
 		stdinR.Close()
 		stdinW.Close()
@@ -351,6 +409,7 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 	console := newConsole(stdinW, stdoutR)
 	mg.mu.Lock()
 	e.console = console
+	e.vsockUDS = vsockUDS
 	mg.mu.Unlock()
 
 	mg.markRunning(e)
@@ -368,12 +427,14 @@ func (mg *Manager) run(ctx context.Context, e *entry) {
 	log.Printf("[%s] exited", e.m.ID)
 }
 
-// writeResolvConf mounts the rootfs block device read-write, overwrites
-// /etc/resolv.conf with a single nameserver entry, and unmounts. Done before
-// firecracker opens the device. The Firecracker SDK can pass nameservers via
-// /proc/net/pnp, but that requires the guest to symlink resolv.conf to it; we
-// use Alpine images out of the box so we just write the file.
-func writeResolvConf(device, dns string) error {
+// prepareRootfs mounts the rootfs block device read-write, copies the static
+// hyperfleet-init binary into /sbin/hyperfleet-init, optionally writes
+// /etc/resolv.conf with the allocated DNS server, and unmounts. Done once
+// before firecracker opens the device. The Firecracker SDK can pass
+// nameservers via /proc/net/pnp, but that requires the guest to symlink
+// resolv.conf to it; we use Alpine images out of the box so we just write
+// the file.
+func prepareRootfs(device, initdSrc, dns string) error {
 	mp, err := os.MkdirTemp("", "hf-rootfs-")
 	if err != nil {
 		return fmt.Errorf("mkdir mountpoint: %w", err)
@@ -389,11 +450,47 @@ func writeResolvConf(device, dns string) error {
 		}
 	}()
 
-	etc := filepath.Join(mp, "etc")
-	if err := os.MkdirAll(etc, 0o755); err != nil {
-		return fmt.Errorf("mkdir etc: %w", err)
+	if initdSrc != "" {
+		sbin := filepath.Join(mp, "sbin")
+		if err := os.MkdirAll(sbin, 0o755); err != nil {
+			return fmt.Errorf("mkdir sbin: %w", err)
+		}
+		if err := copyFile(initdSrc, filepath.Join(sbin, "hyperfleet-init"), 0o755); err != nil {
+			return fmt.Errorf("install initd: %w", err)
+		}
 	}
-	return os.WriteFile(filepath.Join(etc, "resolv.conf"), []byte("nameserver "+dns+"\n"), 0o644)
+
+	if dns != "" {
+		etc := filepath.Join(mp, "etc")
+		if err := os.MkdirAll(etc, 0o755); err != nil {
+			return fmt.Errorf("mkdir etc: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(etc, "resolv.conf"), []byte("nameserver "+dns+"\n"), 0o644); err != nil {
+			return fmt.Errorf("write resolv.conf: %w", err)
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Chmod(mode); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // leaseHolder wraps the active lease so the renewal goroutine can swap it out
@@ -472,14 +569,15 @@ func (mg *Manager) prepareSnapshot(ctx context.Context, image client.Image, id s
 	return mounts[0].Source, cleanup, nil
 }
 
-func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin io.Reader, stdout io.Writer, alloc network.Allocation) (*firecracker.Machine, error) {
+func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin io.Reader, stdout io.Writer, alloc network.Allocation, cid uint32, vsockUDS string) (*firecracker.Machine, error) {
 	socketPath := filepath.Join(workDir, "firecracker.sock")
 	_ = os.Remove(socketPath)
+	_ = os.Remove(vsockUDS)
 
 	cfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: mg.cfg.KernelPath,
-		KernelArgs:      "console=ttyS0 reboot=k panic=1 acpi=off init=/bin/sh",
+		KernelArgs:      "console=ttyS0 reboot=k panic=1 acpi=off init=/sbin/hyperfleet-init",
 		Drives: []models.Drive{{
 			DriveID:      firecracker.String("rootfs"),
 			PathOnHost:   firecracker.String(rootfsDevice),
@@ -491,6 +589,11 @@ func (mg *Manager) boot(ctx context.Context, rootfsDevice, workDir string, stdin
 			MemSizeMib: firecracker.Int64(256),
 			Smt:        firecracker.Bool(false),
 		},
+		VsockDevices: []firecracker.VsockDevice{{
+			ID:   "vsock0",
+			Path: vsockUDS,
+			CID:  cid,
+		}},
 	}
 
 	if alloc.TapName != "" {
