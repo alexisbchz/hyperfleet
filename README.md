@@ -347,56 +347,17 @@ Spec is generated at startup from the registered `huma.Operation`s in
 
 ## Forgejo Actions integration
 
-`forgejo-plugin/` is a separate Go module that exposes hyperfleet as a
-[Forgejo Runner v2 backend plugin](https://code.forgejo.org/forgejo/forgejo-actions-feature-requests/issues/107).
-The runner launches it as a subprocess via [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin);
-the plugin translates each `pluginv1.BackendPlugin` RPC into HTTP calls
-against this daemon's REST API:
+A [Forgejo Runner v2 backend plugin](https://code.forgejo.org/forgejo/forgejo-actions-feature-requests/issues/107)
+that runs CI jobs inside hyperfleet microVMs lives in its own repo:
+
+**[hyperfleet-forgejo-plugin](https://github.com/alexisbchz/hyperfleet-forgejo-plugin)**
 
 ```
 runner ── go-plugin ──> hyperfleet-forgejo-plugin ── HTTP ──> hyperfleet daemon ── vsock ──> initd
 ```
 
-Build it with `make plugin`. To wire it into a runner:
-
-```yaml
-# runner config.yaml
-pluginsv2:
-  hyperfleet:
-    path: /path/to/hyperfleet-forgejo-plugin
-    options: {}
-```
-
-then point the plugin at the daemon via env on the runner process:
-
-```sh
-export HYPERFLEET_API_URL=http://localhost:8080
-export HYPERFLEET_API_KEY=<key>
-forgejo-runner --config config.yaml daemon
-```
-
-A workflow targets the backend with the runner's `<name>:<scheme>://<arg>`
-label format. The label name selects the plugin; the arg is forwarded to
-`Create` via `BackendOptions["label_arg"]` and the plugin uses it as the
-OCI image:
-
-```yaml
-# .forgejo/workflows/hello.yml
-on: [push]
-jobs:
-  greet:
-    runs-on: hyperfleet:hyperfleet://docker.io/library/alpine:3.20
-    steps:
-      - run: echo "hello from a microVM"
-```
-
-The plugin currently exposes one capability per axis: `manages_own_networking=true`,
-`supports_local_copy=true`, `supports_docker_actions=false`, and
-`supports_service_containers=false`. The runner module path
-`code.forgejo.org/forgejo/runner/v12` is replaced with a local clone of
-[Erwan's plugin-fork](https://git.erwanleboucher.dev/eleboucher/runner) at
-`.deps/forgejo-runner-erwan/` because the plugin contract isn't in upstream
-`v12.10.0` yet.
+See that repo's README for build, registration, and workflow targeting. A
+workflow opts in via `runs-on: hyperfleet:hyperfleet://<oci-image>`.
 
 ## SSH gateway
 

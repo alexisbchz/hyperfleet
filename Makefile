@@ -1,4 +1,4 @@
-.PHONY: install-firecracker install-containerd setup-devmapper setup kernel bootstrap run stop tidy build fleet initd plugin
+.PHONY: install-firecracker install-containerd setup-devmapper setup kernel bootstrap run stop tidy build fleet initd
 
 install-firecracker:
 	./scripts/install-firecracker.sh
@@ -40,6 +40,3 @@ fleet:
 
 initd:
 	$(MAKE) -C initd
-
-plugin:
-	cd forgejo-plugin && go build -o ../bin/hyperfleet-forgejo-plugin .
