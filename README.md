@@ -359,6 +359,15 @@ runner ── go-plugin ──> hyperfleet-forgejo-plugin ── HTTP ──> hy
 See that repo's README for build, registration, and workflow targeting. A
 workflow opts in via `runs-on: hyperfleet:hyperfleet://<oci-image>`.
 
+![Forgejo Actions running CI jobs on hyperfleet microVMs](docs/screenshots/01-actions-overview.png)
+
+The log pane below shows a step's stdout streaming back from inside the
+microVM — `uname -a`, `cat /etc/alpine-release`, and `whoami` — as the
+in-guest initd frames each chunk over vsock and the daemon proxies it
+to the runner:
+
+![microVM stdout in Forgejo's log pane](docs/screenshots/logs-04-uname-success.png)
+
 ## SSH gateway
 
 The daemon embeds an SSH server (built on
